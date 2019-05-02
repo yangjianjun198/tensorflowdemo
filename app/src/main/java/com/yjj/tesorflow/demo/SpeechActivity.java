@@ -40,6 +40,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
+import android.os.Message;
 import android.util.Log;
 import android.view.View;
 import android.view.ViewTreeObserver;
@@ -56,7 +57,6 @@ import com.yjj.tesorflow.demo.utils.TensorModelFileUtils;
 import org.tensorflow.lite.Interpreter;
 
 import java.util.ArrayList;
-import java.util.Date;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -84,7 +84,10 @@ public class SpeechActivity extends Activity implements View.OnClickListener, Co
     private static final int SUPPRESSION_MS = 1500;
     private static final int MINIMUM_COUNT = 3;
     private static final long MINIMUM_TIME_BETWEEN_SAMPLES_MS = 30;
-
+    private static final int WHAT_RECORD_START = 1;
+    private static final int WHAT_RECORD_STOP = 2;
+    private static final int WHAT_RECOGNIZE_START = 3;
+    private static final int WHAT_RECOGNIZE_STOP = 4;
     // UI elements.
     private static final int REQUEST_RECORD_AUDIO = 13;
     private static final String LOG_TAG = SpeechActivity.class.getSimpleName();
@@ -92,10 +95,8 @@ public class SpeechActivity extends Activity implements View.OnClickListener, Co
     // Working variables.
     short[] recordingBuffer = new short[RECORDING_LENGTH];
     int recordingOffset = 0;
-    boolean shouldContinue = true;
-    private Thread recordingThread;
-    boolean shouldContinueRecognition = true;
-    private Thread recognitionThread;
+    private volatile boolean shouldRecordContinue = false;
+    private volatile boolean shouldContinueRecognition = false;
     private final ReentrantLock recordingBufferLock = new ReentrantLock();
 
     private List<String> labels = new ArrayList<String>();
@@ -120,6 +121,12 @@ public class SpeechActivity extends Activity implements View.OnClickListener, Co
     private HandlerThread backgroundThread;
     private Handler backgroundHandler;
     private boolean modelIsLoading = false;
+    private HandlerThread recordHandlerThread;
+    private HandlerThread recognizeHandlerThread;
+    private Handler recongnizeHander;
+
+    private Handler recordHandler;
+    private volatile boolean modelLoadSuccess = false;
 
     @Override
     public void onFinish() {
@@ -240,8 +247,11 @@ public class SpeechActivity extends Activity implements View.OnClickListener, Co
                 tfLite = new Interpreter(mappedByteBuffer);
                 tfLite.resizeInput(0, new int[] { RECORDING_LENGTH, 1 });
                 tfLite.resizeInput(1, new int[] { 1 });
-                startRecording();
-                startRecognition();
+                if (!modelLoadSuccess) {
+                    startRecording();
+                    startRecognition();
+                    modelLoadSuccess = true;
+                }
             });
         } catch (Exception e) {
 
@@ -262,23 +272,33 @@ public class SpeechActivity extends Activity implements View.OnClickListener, Co
         }
     }
 
-    public synchronized void startRecording() {
-        if (recordingThread != null) {
+    public void startRecording() {
+        if (shouldRecordContinue) {
             return;
         }
-        shouldContinue = true;
-        recordingThread = new Thread(() -> {
-            record();
-        });
-        recordingThread.start();
+        if (recordHandlerThread == null) {
+            recordHandlerThread = new HandlerThread("recordThread");
+            recordHandlerThread.start();
+            recordHandler = new Handler(recordHandlerThread.getLooper()) {
+                @Override
+                public void handleMessage(Message msg) {
+                    if (msg.what == WHAT_RECORD_START) {
+                        record();
+                    }
+                }
+            };
+        }
+        if (recordHandler.hasMessages(WHAT_RECORD_START)) {
+            return;
+        }
+        shouldRecordContinue = true;
+        recordHandler.sendEmptyMessage(WHAT_RECORD_START);
     }
 
-    public synchronized void stopRecording() {
-        if (recordingThread == null) {
-            return;
+    public void stopRecording() {
+        if (shouldRecordContinue) {
+            shouldRecordContinue = false;
         }
-        shouldContinue = false;
-        recordingThread = null;
     }
 
     private void record() {
@@ -306,7 +326,7 @@ public class SpeechActivity extends Activity implements View.OnClickListener, Co
         Log.v(LOG_TAG, "Start recording");
 
         // Loop, gathering audio data and copying it to a round-robin buffer.
-        while (shouldContinue) {
+        while (shouldRecordContinue) {
             int numberRead = record.read(audioBuffer, 0, audioBuffer.length);
             int maxLength = recordingBuffer.length;
             int newRecordingOffset = recordingOffset + numberRead;
@@ -330,22 +350,32 @@ public class SpeechActivity extends Activity implements View.OnClickListener, Co
     }
 
     public synchronized void startRecognition() {
-        if (recognitionThread != null) {
+        if (shouldContinueRecognition) {
+            return;
+        }
+        if (recognizeHandlerThread == null) {
+            recognizeHandlerThread = new HandlerThread("recognizeThread");
+            recognizeHandlerThread.start();
+            recongnizeHander = new Handler(recognizeHandlerThread.getLooper()) {
+                @Override
+                public void handleMessage(Message msg) {
+                    if (msg.what == WHAT_RECOGNIZE_START) {
+                        recognize();
+                    }
+                }
+            };
+        }
+        if (recongnizeHander.hasMessages(WHAT_RECOGNIZE_START)) {
             return;
         }
         shouldContinueRecognition = true;
-        recognitionThread = new Thread(() -> {
-            recognize();
-        });
-        recognitionThread.start();
+        recongnizeHander.sendEmptyMessage(WHAT_RECOGNIZE_START);
     }
 
     public synchronized void stopRecognition() {
-        if (recognitionThread == null) {
-            return;
+        if (shouldContinueRecognition) {
+            shouldContinueRecognition = false;
         }
-        shouldContinueRecognition = false;
-        recognitionThread = null;
     }
 
     private void recognize() {
@@ -361,7 +391,7 @@ public class SpeechActivity extends Activity implements View.OnClickListener, Co
 
         // Loop, grabbing recorded data and running the recognition model on it.
         while (shouldContinueRecognition) {
-            long startTime = new Date().getTime();
+            long startTime = System.currentTimeMillis();
             // The recording thread places data in this round-robin buffer, so lock to
             // make sure there's no writing happening and then copy it to our own
             // local version.
@@ -393,71 +423,63 @@ public class SpeechActivity extends Activity implements View.OnClickListener, Co
             long currentTime = System.currentTimeMillis();
             final RecognizeCommands.RecognitionResult result =
                 recognizeCommands.processLatestResults(outputScores[0], currentTime);
-            lastProcessingTimeMs = new Date().getTime() - startTime;
-            runOnUiThread(new Runnable() {
-                @Override
-                public void run() {
+            lastProcessingTimeMs = System.currentTimeMillis() - startTime;
+            runOnUiThread(() -> {
+                inferenceTimeTextView.setText(lastProcessingTimeMs + " ms");
 
-                    inferenceTimeTextView.setText(lastProcessingTimeMs + " ms");
-
-                    // If we do have a new command, highlight the right list entry.
-                    if (!result.foundCommand.startsWith("_") && result.isNewCommand) {
-                        int labelIndex = -1;
-                        for (int i = 0; i < labels.size(); ++i) {
-                            if (labels.get(i).equals(result.foundCommand)) {
-                                labelIndex = i;
-                            }
+                // If we do have a new command, highlight the right list entry.
+                if (!result.foundCommand.startsWith("_") && result.isNewCommand) {
+                    int labelIndex = -1;
+                    for (int i = 0; i < labels.size(); ++i) {
+                        if (labels.get(i).equals(result.foundCommand)) {
+                            labelIndex = i;
                         }
+                    }
 
-                        switch (labelIndex - 2) {
-                            case 0:
-                                selectedTextView = yesTextView;
-                                break;
-                            case 1:
-                                selectedTextView = noTextView;
-                                break;
-                            case 2:
-                                selectedTextView = upTextView;
-                                break;
-                            case 3:
-                                selectedTextView = downTextView;
-                                break;
-                            case 4:
-                                selectedTextView = leftTextView;
-                                break;
-                            case 5:
-                                selectedTextView = rightTextView;
-                                break;
-                            case 6:
-                                selectedTextView = onTextView;
-                                break;
-                            case 7:
-                                selectedTextView = offTextView;
-                                break;
-                            case 8:
-                                selectedTextView = stopTextView;
-                                break;
-                            case 9:
-                                selectedTextView = goTextView;
-                                break;
-                        }
+                    switch (labelIndex - 2) {
+                        case 0:
+                            selectedTextView = yesTextView;
+                            break;
+                        case 1:
+                            selectedTextView = noTextView;
+                            break;
+                        case 2:
+                            selectedTextView = upTextView;
+                            break;
+                        case 3:
+                            selectedTextView = downTextView;
+                            break;
+                        case 4:
+                            selectedTextView = leftTextView;
+                            break;
+                        case 5:
+                            selectedTextView = rightTextView;
+                            break;
+                        case 6:
+                            selectedTextView = onTextView;
+                            break;
+                        case 7:
+                            selectedTextView = offTextView;
+                            break;
+                        case 8:
+                            selectedTextView = stopTextView;
+                            break;
+                        case 9:
+                            selectedTextView = goTextView;
+                            break;
+                    }
 
-                        if (selectedTextView != null) {
-                            selectedTextView.setBackgroundResource(R.drawable.round_corner_text_bg_selected);
-                            final String score = Math.round(result.score * 100) + "%";
-                            selectedTextView.setText(selectedTextView.getText() + "\n" + score);
-                            selectedTextView.setTextColor(getResources().getColor(android.R.color.holo_orange_light));
-                            handler.postDelayed(new Runnable() {
-                                @Override
-                                public void run() {
-                                    String origionalString =
-                                        selectedTextView.getText().toString().replace(score, "").trim();
-                                    selectedTextView.setText(origionalString);
-                                    selectedTextView.setBackgroundResource(R.drawable.round_corner_text_bg_unselected);
-                                    selectedTextView.setTextColor(getResources().getColor(android.R.color.darker_gray));
-                                }
-                            }, 750);
-                        }
+                    if (selectedTextView != null) {
+                        selectedTextView.setBackgroundResource(R.drawable.round_corner_text_bg_selected);
+                        final String score = Math.round(result.score * 100) + "%";
+                        selectedTextView.setText(selectedTextView.getText() + "\n" + score);
+                        selectedTextView.setTextColor(getResources().getColor(android.R.color.holo_orange_light));
+                        handler.postDelayed(() -> {
+                            String origionalString = selectedTextView.getText().toString().replace(score, "").trim();
+                            selectedTextView.setText(origionalString);
+                            selectedTextView.setBackgroundResource(R.drawable.round_corner_text_bg_unselected);
+                            selectedTextView.setTextColor(getResources().getColor(android.R.color.darker_gray));
+                        }, 750);
                     }
                 }
             });
@@ -479,7 +501,6 @@ public class SpeechActivity extends Activity implements View.OnClickListener, Co
             int numThreads = Integer.parseInt(threads);
             numThreads++;
             threadsTextView.setText(String.valueOf(numThreads));
-            //            tfLite.setNumThreads(numThreads);
             int finalNumThreads = numThreads;
             backgroundHandler.post(() -> tfLite.setNumThreads(finalNumThreads));
         } else if (v.getId() == R.id.minus) {
@@ -528,13 +549,46 @@ public class SpeechActivity extends Activity implements View.OnClickListener, Co
     @Override
     protected void onResume() {
         super.onResume();
-
         startBackgroundThread();
+        if (modelLoadSuccess) {
+            startRecording();
+            startRecognition();
+        }
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        if (modelLoadSuccess) {
+            stopRecording();
+            stopRecognition();
+        }
     }
 
     @Override
     protected void onStop() {
         super.onStop();
         stopBackgroundThread();
+        if (isFinishing()) {
+            try {
+                if (modelLoadSuccess) {
+                    stopRecording();
+                    stopRecognition();
+                }
+                if (recognizeHandlerThread != null) {
+                    recognizeHandlerThread.quitSafely();
+                }
+                if (recordHandlerThread != null) {
+                    recordHandlerThread.quitSafely();
+                }
+            } catch (Exception ignore) {
+
+            }
+        }
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
     }
 }
